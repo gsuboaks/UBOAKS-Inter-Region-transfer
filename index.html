@@ -710,11 +710,13 @@ function buildCharts(entries){
 
 // ── LOGIN / VERIFICATION ──────────────────────────────────────────
 async function doLogin(){
-  var empId = document.getElementById('loginEmpId').value.trim();
-  var dob   = document.getElementById('loginDob').value;
-  var err   = document.getElementById('loginErr');
+  var empId   = document.getElementById('loginEmpId').value.trim();
+  var dob     = document.getElementById('loginDob').value;
+  var err     = document.getElementById('loginErr');
+  var btn     = document.querySelector('.btn-login');
   err.style.display = 'none';
 
+  // ── Basic input validation ──────────────────────────────────────
   if(!/^\d{6}$/.test(empId)){
     err.textContent = 'Employee ID must be exactly 6 digits.';
     err.style.display = 'block'; return;
@@ -724,41 +726,83 @@ async function doLogin(){
     err.style.display = 'block'; return;
   }
 
-  // Check local first
-  var entries = getAll();
-  var existing = entries.find(function(e){ return e.empId === empId; });
+  btn.textContent = 'Verifying…';
+  btn.disabled    = true;
 
-  // If configured, try to verify/fetch from sheet
+  // ── CASE 1: Google Sheets is configured — authoritative check ───
+  // The sheet is the single source of truth.
+  // If the member exists there, DOB MUST match what is stored there.
+  // If the member does not exist there, treat as new (allow blank form).
   if(isConfigured()){
     try{
-      var res = await scriptGet(APPS_SCRIPT_URL + '?action=findMember&empId=' + encodeURIComponent(empId) + '&dob=' + encodeURIComponent(dob));
+      var res = await Promise.race([
+        scriptGet(APPS_SCRIPT_URL + '?action=findMember&empId='
+          + encodeURIComponent(empId) + '&dob=' + encodeURIComponent(dob)),
+        new Promise(function(_,rej){
+          setTimeout(function(){ rej(new Error('timeout')); }, 12000);
+        })
+      ]);
+
+      btn.textContent = 'Continue →';
+      btn.disabled    = false;
+
       if(res && res.status === 'notfound'){
-        // New member — show blank form
+        // Not in sheet → genuine new member → show blank form
         openBlankForm(empId, dob);
         return;
-      } else if(res && res.status === 'found' && res.entry){
-        // Existing member — load their data
+      }
+      if(res && res.status === 'found' && res.entry){
+        // Found in sheet AND DOB matched (Apps Script verified it)
         openExistingForm(res.entry, 0);
         return;
-      } else if(res && res.status === 'wrongdob'){
-        err.textContent = 'Date of Birth does not match our records for this Employee ID.';
-        err.style.display = 'block'; return;
       }
-    }catch(e){
-      console.warn('Sheet lookup failed, falling back to local:', e);
+      if(res && res.status === 'wrongdob'){
+        // Employee ID found in sheet but DOB did NOT match
+        err.textContent = 'The Date of Birth entered does not match our records for Employee ID '
+          + empId + '. Please check and try again.';
+        err.style.display = 'block';
+        return;
+      }
+      // Any other unexpected response — fall through to local check
+    } catch(sheetErr){
+      console.warn('Sheet lookup failed, using local fallback:', sheetErr);
+      // Do not block the user if the network failed — fall through
     }
   }
 
-  // Offline fallback: use local data
-  // If no sheet, trust DOB as entered (no server-side verification)
+  btn.textContent = 'Continue →';
+  btn.disabled    = false;
+
+  // ── CASE 2: Offline / Sheet not reachable — use local storage ──
+  // Security rule:
+  //   • If a local entry EXISTS → DOB MUST match what was saved at submission time.
+  //     We ALWAYS stored the DOB at submission, so existing.dob will always be set.
+  //     If DOB does not match → block access.
+  //   • If NO local entry exists → treat as new member → show blank form.
+  //     (DOB entered now becomes the one stored when they submit.)
+  var entries  = getAll();
+  var existing = entries.find(function(e){ return e.empId === empId; });
+
   if(existing){
-    // Verify DOB matches stored
-    if(existing.dob && existing.dob !== dob){
-      err.textContent = 'Date of Birth does not match our records for this Employee ID.';
-      err.style.display = 'block'; return;
+    // Existing local entry — enforce DOB check strictly
+    if(!existing.dob){
+      // Edge case: very old entry saved before DOB field was added.
+      // Save the DOB they just entered and allow access.
+      existing.dob = dob;
+      entries[entries.indexOf(existing)] = existing;
+      saveAll(entries);
+      openExistingForm(existing, entries.indexOf(existing));
+    } else if(existing.dob === dob){
+      // DOB matches — allow access
+      openExistingForm(existing, entries.indexOf(existing));
+    } else {
+      // DOB mismatch — deny access
+      err.textContent = 'The Date of Birth entered does not match our records for Employee ID '
+        + empId + '. Please check and try again.';
+      err.style.display = 'block';
     }
-    openExistingForm(existing, entries.indexOf(existing));
   } else {
+    // No existing entry anywhere → new member → blank form
     openBlankForm(empId, dob);
   }
 }
