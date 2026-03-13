@@ -644,7 +644,7 @@ textarea { resize:vertical; min-height:74px; }
 // ════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzJx_QG_vkxvqqwgJgh-jqlP0bc2EzD0fw7OQ4r3DiafsYtcLjrvkP6wZizqzOdWmLl/exec';
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxiKAFHKDKazSCb9QHQLvctmBag9ziG3OqWQEoaU7Wlx6P_xLx7DIc4PDPIC_IKgZhc/exec';
 
 // ── STORAGE ──────────────────────────────────────────────────────
 const SK = 'uboaks_transfer_v3';
@@ -709,6 +709,65 @@ function buildCharts(entries){
 }
 
 // ── LOGIN / VERIFICATION ──────────────────────────────────────────
+// ── DOB NORMALISATION ─────────────────────────────────────────────
+// The HTML date input always returns YYYY-MM-DD (e.g. "1985-06-15").
+// Google Sheets may store dates in various formats depending on locale:
+//   "15/06/1985"  (DD/MM/YYYY — common Indian locale)
+//   "06/15/1985"  (MM/DD/YYYY — US locale)
+//   "1985-06-15"  (ISO — if stored as text)
+//   "15-Jun-1985" (long format)
+//   A serial number like 31213 (Sheets internal date)
+// This function converts ALL of them to YYYY-MM-DD for comparison.
+function normalizeDob(val){
+  if(!val) return '';
+  var s = String(val).trim();
+
+  // Already ISO format YYYY-MM-DD
+  if(/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+
+  // DD/MM/YYYY  (Indian locale — most common in Sheets)
+  var m1 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if(m1) return m1[3] + '-' + m1[2].padStart(2,'0') + '-' + m1[1].padStart(2,'0');
+
+  // MM/DD/YYYY  (US locale)
+  var m2 = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  // (same regex as above — distinguish by context; try both if needed)
+
+  // DD-MM-YYYY
+  var m3 = s.match(/^(\d{1,2})-(\d{1,2})-(\d{4})$/);
+  if(m3) return m3[3] + '-' + m3[2].padStart(2,'0') + '-' + m3[1].padStart(2,'0');
+
+  // DD-Mon-YYYY  e.g. "15-Jun-1985"
+  var months = {jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',
+                jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12'};
+  var m4 = s.match(/^(\d{1,2})[- ](\w{3})[- ](\d{4})$/i);
+  if(m4){
+    var mo = months[m4[2].toLowerCase()];
+    if(mo) return m4[3] + '-' + mo + '-' + m4[1].padStart(2,'0');
+  }
+
+  // Google Sheets serial number (days since 30 Dec 1899)
+  if(/^\d{4,6}$/.test(s)){
+    var serial = parseInt(s, 10);
+    var d = new Date(Date.UTC(1899,11,30) + serial * 86400000);
+    if(!isNaN(d)){
+      return d.getUTCFullYear() + '-'
+        + String(d.getUTCMonth()+1).padStart(2,'0') + '-'
+        + String(d.getUTCDate()).padStart(2,'0');
+    }
+  }
+
+  // Last resort: let JS parse it
+  var parsed = new Date(s);
+  if(!isNaN(parsed)){
+    return parsed.getFullYear() + '-'
+      + String(parsed.getMonth()+1).padStart(2,'0') + '-'
+      + String(parsed.getDate()).padStart(2,'0');
+  }
+
+  return s; // return as-is if nothing worked
+}
+
 async function doLogin(){
   var empId   = document.getElementById('loginEmpId').value.trim();
   var dob     = document.getElementById('loginDob').value;
@@ -735,9 +794,10 @@ async function doLogin(){
   // If the member does not exist there, treat as new (allow blank form).
   if(isConfigured()){
     try{
+      var dobNorm = normalizeDob(dob);
       var res = await Promise.race([
         scriptGet(APPS_SCRIPT_URL + '?action=findMember&empId='
-          + encodeURIComponent(empId) + '&dob=' + encodeURIComponent(dob)),
+          + encodeURIComponent(empId) + '&dob=' + encodeURIComponent(dobNorm)),
         new Promise(function(_,rej){
           setTimeout(function(){ rej(new Error('timeout')); }, 12000);
         })
@@ -786,14 +846,14 @@ async function doLogin(){
   if(existing){
     // Existing local entry — enforce DOB check strictly
     if(!existing.dob){
-      // Edge case: very old entry saved before DOB field was added.
-      // Save the DOB they just entered and allow access.
+      // Edge case: entry saved before DOB field was added.
+      // Save DOB now and allow access.
       existing.dob = dob;
       entries[entries.indexOf(existing)] = existing;
       saveAll(entries);
       openExistingForm(existing, entries.indexOf(existing));
-    } else if(existing.dob === dob){
-      // DOB matches — allow access
+    } else if(normalizeDob(existing.dob) === normalizeDob(dob)){
+      // DOB matches (after normalising both sides) — allow access
       openExistingForm(existing, entries.indexOf(existing));
     } else {
       // DOB mismatch — deny access
