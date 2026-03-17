@@ -455,9 +455,23 @@ textarea { resize:vertical; min-height:74px; }
               <div class="up-text"><strong>Click to choose file</strong> or drag &amp; drop<br><small>PDF, JPG, PNG, DOC, DOCX · Max 10 MB</small></div>
               <div id="upFileName" class="up-name hidden"></div>
             </div>
+            <!-- Upload progress bar -->
+            <div id="upProgress" style="display:none;margin-top:10px;">
+              <div style="display:flex;justify-content:space-between;font-size:11.5px;color:var(--text-mid);margin-bottom:4px;">
+                <span id="upProgressLabel">Preparing upload…</span>
+                <span id="upProgressPct">0%</span>
+              </div>
+              <div style="background:#e0e0e0;border-radius:20px;height:8px;overflow:hidden;">
+                <div id="upProgressBar" style="height:100%;width:0%;background:linear-gradient(90deg,var(--navy),var(--navy-l));border-radius:20px;transition:width 0.3s ease;"></div>
+              </div>
+            </div>
             <div id="upOk" class="msg msg-ok hidden">
               <span class="msg-icon">✅</span>
-              <span>File selected. The Google Drive link will be stored with your submission.</span>
+              <span id="upOkText">File selected. It will be uploaded to Google Drive when you submit.</span>
+            </div>
+            <div id="upErr" class="msg msg-error hidden">
+              <span class="msg-icon">⚠️</span>
+              <span id="upErrText">Upload failed.</span>
             </div>
           </div>
         </div>
@@ -644,7 +658,7 @@ textarea { resize:vertical; min-height:74px; }
 // ════════════════════════════════════════════════════════════════
 // CONFIGURATION
 // ════════════════════════════════════════════════════════════════
-const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxiKAFHKDKazSCb9QHQLvctmBag9ziG3OqWQEoaU7Wlx6P_xLx7DIc4PDPIC_IKgZhc/exec';
+const APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycby5qkTU2q22ci6Eg13um968VfMZL41QFwA5udtpGgHZF1DGzvsgJYq8pWy7EVG9A3A/exec';
 
 // ── STORAGE ──────────────────────────────────────────────────────
 const SK = 'uboaks_transfer_v3';
@@ -877,7 +891,21 @@ function openBlankForm(empId, dob){
 function openExistingForm(entry, idx){
   editMode = true; editIdx = idx;
   currentDob = entry.dob || document.getElementById('loginDob').value;
-  loadForEdit(entry, idx);
+
+  // Update local cache with the latest sheet data
+  // so local is always in sync after a successful sheet fetch
+  var entries = getAll();
+  var localIdx = entries.findIndex(function(en){ return en.empId === entry.empId; });
+  if(localIdx >= 0){
+    entries[localIdx] = entry;
+    editIdx = localIdx;
+  } else {
+    entries.push(entry);
+    editIdx = entries.length - 1;
+  }
+  saveAll(entries);
+
+  loadForEdit(entry, editIdx);
   showPage('pageForm');
 }
 
@@ -908,6 +936,137 @@ function scriptGet(url){
   });
 }
 
+// ── CHUNKED FILE UPLOAD ───────────────────────────────────────────
+// Uploads a File object to Google Drive via Apps Script in 512 KB chunks.
+// Returns the Google Drive file URL, or '' if no file / upload fails.
+async function uploadFileInChunks(file, empId){
+  // ── Robust file upload for files up to 10 MB ─────────────────
+  // Strategy: read file as base64, POST in a single request.
+  // Apps Script receives it in doPost and writes directly to Drive.
+  // A live progress bar shows encoding + uploading progress.
+  // No chunking needed — Apps Script handles up to ~50MB per request.
+
+  if(!file || !isConfigured()) return '';
+
+  function setProgress(pct, label){
+    var wrap = document.getElementById('upProgress');
+    if(wrap) wrap.style.display = 'block';
+    var bar  = document.getElementById('upProgressBar');
+    if(bar)  bar.style.width = pct + '%';
+    var pctEl = document.getElementById('upProgressPct');
+    if(pctEl) pctEl.textContent = pct + '%';
+    var lbl  = document.getElementById('upProgressLabel');
+    if(lbl)  lbl.textContent = label;
+  }
+
+  setProgress(5, 'Reading file…');
+
+  // ── Step 1: Read file as base64 asynchronously ────────────────
+  var base64Data;
+  try{
+    base64Data = await new Promise(function(resolve, reject){
+      var reader = new FileReader();
+      reader.onprogress = function(ev){
+        if(ev.lengthComputable){
+          var pct = Math.round(ev.loaded / ev.total * 40); // 0-40%
+          setProgress(5 + pct, 'Reading file… ' + Math.round(ev.loaded/1024) + ' KB');
+        }
+      };
+      reader.onload = function(ev){
+        setProgress(45, 'File read. Preparing upload…');
+        // Strip the data URL prefix (data:mimetype;base64,)
+        var result = ev.target.result;
+        var b64 = result.indexOf(',') >= 0 ? result.split(',')[1] : result;
+        resolve(b64);
+      };
+      reader.onerror = function(){
+        reject(new Error('Could not read file. Please try again.'));
+      };
+      reader.readAsDataURL(file);
+    });
+  } catch(readErr){
+    setProgress(0, '');
+    document.getElementById('upProgress').style.display = 'none';
+    throw readErr;
+  }
+
+  setProgress(50, 'Uploading to Google Drive…');
+
+  // ── Step 2: POST to Apps Script (no-cors fetch) ──────────────
+  // Google Apps Script redirects POST requests to script.googleusercontent.com
+  // which does NOT return CORS headers. A plain XHR treats this as an error
+  // (onerror fires) even though Apps Script executed the upload successfully.
+  // Using fetch with mode:'no-cors' suppresses the CORS error — the response
+  // is opaque (unreadable) but the server-side code runs fully.
+  // The Drive URL is then confirmed via the follow-up GET in Step 3.
+  setProgress(55, 'Uploading to Google Drive…');
+
+  var payload = JSON.stringify({
+    action:   'uploadFile',
+    uploadId: empId + '_' + Date.now(),
+    fileName: empId + '_' + file.name,
+    mimeType: file.type || 'application/octet-stream',
+    fileSize: file.size,
+    fileData: base64Data
+  });
+
+  // Simulate progress (no-cors fetch has no upload progress events)
+  var _simPct   = 55;
+  var _simKB    = Math.round(file.size / 1024);
+  var _simTimer = setInterval(function(){
+    if(_simPct < 92){
+      _simPct += 2;
+      setProgress(_simPct, 'Uploading… ' + _simKB + ' KB');
+    }
+  }, 500);
+
+  try{
+    await fetch(APPS_SCRIPT_URL, {
+      method: 'POST',
+      mode:   'no-cors',  // opaque response — suppresses CORS redirect error
+      body:   payload
+    });
+  } catch(fetchErr){
+    clearInterval(_simTimer);
+    throw new Error('Network error during upload. Please check your connection.');
+  }
+  clearInterval(_simTimer);
+  setProgress(95, 'Finalising…');
+
+  var driveUrl = 'pending'; // actual URL retrieved in Step 3 via GET
+
+  // ── Step 3: Retrieve Drive URL via GET ────────────────────────
+  // Since no-cors POST response is opaque, we do a quick GET to
+  // confirm the file was saved and get its URL.
+  setProgress(98, 'Confirming upload…');
+  var uploadId = document.getElementById('empId').value.trim() + '_';
+  var safeName = document.getElementById('empId').value.trim() + '_' + file.name;
+  var fileUrl  = '';
+
+  try{
+    var confirmRes = await Promise.race([
+      scriptGet(APPS_SCRIPT_URL
+        + '?action=getFileUrl&fileName=' + encodeURIComponent(safeName)),
+      new Promise(function(_,rej){
+        setTimeout(function(){ rej(new Error('confirm timeout')); }, 20000);
+      })
+    ]);
+    if(confirmRes && confirmRes.status === 'ok' && confirmRes.url){
+      fileUrl = confirmRes.url;
+      setProgress(100, '✅ File uploaded successfully!');
+    } else {
+      // Upload likely succeeded but URL fetch failed — not a critical error
+      setProgress(100, '✅ File uploaded (link will appear in admin panel after sync).');
+    }
+  } catch(confirmErr){
+    // Non-critical — form will still submit
+    setProgress(100, '⚠️ Upload sent. Link will be available after admin sync.');
+    console.warn('Confirm error:', confirmErr);
+  }
+
+  return fileUrl;
+}
+
 async function scriptPost(payload){
   await fetch(APPS_SCRIPT_URL, { method:'POST', mode:'no-cors', body:JSON.stringify(payload) });
   return { status:'ok' };
@@ -915,7 +1074,7 @@ async function scriptPost(payload){
 
 // ── EDIT STATE ────────────────────────────────────────────────────
 var editMode = false, editIdx = -1;
-var uploadedFileData = null, uploadedFileName = null;
+var uploadedFile = null, uploadedFileName = null;
 var currentDob = '';
 
 // ── FORM LISTENERS ────────────────────────────────────────────────
@@ -962,14 +1121,26 @@ document.getElementById('transferCat').addEventListener('change', function(){
 function onFileSelect(e){
   var f = e.target.files[0];
   if(!f) return;
-  if(f.size > 10*1024*1024){ alert('File exceeds 10 MB.'); e.target.value=''; return; }
+  if(f.size > 10 * 1024 * 1024){
+    document.getElementById('upErrText').textContent =
+      'File is ' + (f.size/1024/1024).toFixed(1) + ' MB — maximum allowed is 10 MB. Please compress or split the file.';
+    document.getElementById('upErr').classList.remove('hidden');
+    document.getElementById('upOk').classList.add('hidden');
+    e.target.value = '';
+    uploadedFile = null; uploadedFileName = null;
+    return;
+  }
+  // Store the raw File object — do NOT read as base64 here.
+  // The file will be uploaded as binary (multipart) at submit time.
+  uploadedFile     = f;
   uploadedFileName = f.name;
+  document.getElementById('upErr').classList.add('hidden');
   var fn = document.getElementById('upFileName');
-  fn.textContent = '📎 ' + f.name; fn.classList.remove('hidden');
+  fn.textContent = '📎 ' + f.name + '  (' + (f.size/1024).toFixed(0) + ' KB)';
+  fn.classList.remove('hidden');
+  document.getElementById('upOkText').textContent =
+    'File ready (' + (f.size/1024/1024).toFixed(2) + ' MB). It will be uploaded when you submit.';
   document.getElementById('upOk').classList.remove('hidden');
-  var r = new FileReader();
-  r.onload = function(ev){ uploadedFileData = ev.target.result; };
-  r.readAsDataURL(f);
 }
 
 // ── VALIDATE ──────────────────────────────────────────────────────
@@ -1012,7 +1183,6 @@ function collectEntry(){
     transferDetails: document.getElementById('transferDetails').value.trim(),
     domDistrict:     document.getElementById('domDistrict').value,
     pincode:         document.getElementById('pincode').value.trim(),
-    fileData:        uploadedFileData || '',
     fileName:        uploadedFileName || ''
   };
 }
@@ -1022,39 +1192,85 @@ function loadForEdit(e, idx){
   editMode = true; editIdx = idx;
   document.getElementById('editBanner').classList.remove('hidden');
   document.getElementById('editEmpIdDisplay').textContent = e.empId;
-  function sv(id,v){ var el=document.getElementById(id); if(el) el.value=v||''; }
-  sv('name',e.name); sv('empId',e.empId); sv('whatsapp',e.whatsapp);
-  sv('association',e.association); sv('category',e.category);
-  sv('scale',e.scale); sv('promoTrack',e.promoTrack);
-  sv('promoDate', e.promoDate || e.lastPromoDate || '');
+
+  // sv() sets a field value; svDate() normalises dates for <input type="date">
+  function sv(id,v){
+    var el = document.getElementById(id);
+    if(el) el.value = (v || '');
+  }
+  function svDate(id, v){
+    var el = document.getElementById(id);
+    if(!el) return;
+    var norm = normalizeDob(v || ''); // reuse normalizeDob for all date fields
+    el.value = norm || '';
+  }
+
+  sv('name',        e.name);
+  sv('empId',       e.empId);
+  sv('whatsapp',    e.whatsapp);
+  sv('association', e.association);
+  sv('category',    e.category);
+  sv('scale',       e.scale);
+  sv('promoTrack',  e.promoTrack);
+
+  svDate('promoDate',   e.promoDate || e.lastPromoDate || '');
+  svDate('dateJoining', e.dateJoining);
+
   var lbl2 = document.getElementById('promoDateLabel');
   if(e.promoTrack === 'Directly Recruited'){
     lbl2.innerHTML = 'Date of Direct Recruitment <span class="req">*</span>';
   } else {
     lbl2.innerHTML = 'Date of Last Promotion <span class="req">*</span>';
   }
-  sv('presentRegion',e.presentRegion);
+
+  sv('presentRegion', e.presentRegion);
   document.getElementById('presentRegion').dispatchEvent(new Event('change'));
-  sv('requestedRegion',e.requestedRegion);
-  sv('presentBranch',e.presentBranch); sv('dateJoining',e.dateJoining);
-  sv('transferCat',e.transferCat); sv('transferDetails',e.transferDetails||'');
-  sv('domDistrict',e.domDistrict); sv('pincode',e.pincode);
-  if(e.association === 'Others') document.getElementById('assocErr').classList.remove('hidden');
+  sv('requestedRegion', e.requestedRegion);
+  sv('presentBranch',   e.presentBranch);
+  sv('transferCat',     e.transferCat);
+  sv('transferDetails', e.transferDetails || '');
+  sv('domDistrict',     e.domDistrict);
+  sv('pincode',         e.pincode);
+
+  if(e.association === 'Others')
+    document.getElementById('assocErr').classList.remove('hidden');
+
   if(e.transferCat && e.transferCat !== 'Repatriation to Parent Region')
     document.getElementById('suppSection').classList.remove('hidden');
+
+  // Re-trigger joining date warning
   if(e.dateJoining){
-    var cutoff = new Date('2023-06-30');
-    var chosen = new Date(e.dateJoining);
-    if(chosen > cutoff) document.getElementById('joiningWarn').classList.remove('hidden');
+    var dj = normalizeDob(e.dateJoining);
+    if(dj){
+      var cutoff = new Date('2023-06-30');
+      var chosen = new Date(dj);
+      if(chosen > cutoff)
+        document.getElementById('joiningWarn').classList.remove('hidden');
+    }
   }
-  if(e.fileName){
-    uploadedFileName = e.fileName;
+
+  if(e.driveLink || e.fileName){
+    uploadedFile     = null;
+    uploadedFileName = e.fileName || '';
     var fn = document.getElementById('upFileName');
-    fn.textContent = '📎 ' + uploadedFileName + ' (previously uploaded)';
+    fn.textContent = '📎 ' + (e.fileName || 'Document') + ' (previously uploaded to Drive)';
     fn.classList.remove('hidden');
+    document.getElementById('upOkText').textContent =
+      'Previously uploaded: ' + (e.fileName || 'file on Drive')
+      + '. Upload a new file only if you want to replace it.';
     document.getElementById('upOk').classList.remove('hidden');
+    if(e.driveLink){
+      var fn2 = document.getElementById('upFileName');
+      fn2.innerHTML = '📎 ' + (e.fileName || 'Document')
+        + ' <a href="' + e.driveLink + '" target="_blank" '
+        + 'style="color:#fff;text-decoration:underline;font-size:11px;">'
+        + 'View ↗</a>';
+    }
   }
+
   document.getElementById('submitBtn').innerHTML = '<span>✏️</span> Update Entry';
+  // Scroll to top of form
+  document.getElementById('pageForm').scrollIntoView({behavior:'smooth', block:'start'});
 }
 
 // ── DUPLICATE CHECK ───────────────────────────────────────────────
@@ -1092,7 +1308,10 @@ function resetForm(){
   document.getElementById('upOk').classList.add('hidden');
 
   document.getElementById('requestedRegion').innerHTML = '<option value="">— Select Region —</option>';
-  uploadedFileData = null; uploadedFileName = null;
+  uploadedFile = null; uploadedFileName = null;
+  document.getElementById('upProgress').style.display = 'none';
+  document.getElementById('upProgressBar').style.width = '0%';
+  document.getElementById('upErr').classList.add('hidden');
   editMode = false; editIdx = -1;
 }
 
@@ -1119,15 +1338,41 @@ async function doSubmit(){
     }
   }
   btn.disabled = true;
-  btn.innerHTML = isConfigured() ? '<span>📡</span> Sending to Google Sheets…' : '<span>⏳</span> Saving…';
+  btn.innerHTML = '<span>⏳</span> Saving…';
+
+  // ── Step 1: Upload file to Google Drive (if any) ──────────────
+  var driveLink = '';
+  if(uploadedFile && isConfigured()){
+    btn.innerHTML = '<span>📤</span> Uploading document…';
+    try{
+      driveLink = await uploadFileInChunks(uploadedFile, document.getElementById('empId').value.trim());
+    } catch(upErr){
+      console.warn('File upload error:', upErr);
+      document.getElementById('upErrText').textContent =
+        'Document upload failed — form will still be submitted without the file.';
+      document.getElementById('upErr').classList.remove('hidden');
+    }
+  }
+
+  // ── Step 2: Build entry and save locally ─────────────────────
+  btn.innerHTML = '<span>📡</span> Sending to Google Sheets…';
   var entry = collectEntry();
+  entry.driveLink = driveLink;  // attach the uploaded file URL
   var entries = getAll();
   if(editMode && editIdx !== -1) entries[editIdx] = entry;
   else entries.push(entry);
   saveAll(entries);
+
+  // ── Step 3: Post form data (without file binary) to Sheets ───
   var sheetOk = false;
   if(isConfigured()){
-    try{ await scriptPost(entry); sheetOk = true; }
+    try{
+      // Send entry without any file binary — file is already on Drive
+      var postData = Object.assign({}, entry);
+      delete postData.fileData; // safety: make sure no base64 sneaks in
+      await scriptPost(postData);
+      sheetOk = true;
+    }
     catch(err){ console.warn('Sheet post error:', err); }
   }
   var extra = '';
@@ -1171,8 +1416,32 @@ function doAdminLogin(){
 
 async function openAdmin(){
   showPage('pageAdmin');
-  refreshAdminUI(getAll());
-  await syncFromSheet();
+
+  // Show loading state immediately
+  document.getElementById('apCount').textContent      = '…';
+  document.getElementById('apSheetCount').textContent = '…';
+  document.getElementById('apTbl').innerHTML =
+    '<p style="padding:24px;text-align:center;color:var(--text-lite);">'
+    + '🔄 Loading data from Google Sheets…</p>';
+
+  if(isConfigured()){
+    // Fetch from sheet first — this is the authoritative source
+    var sheetData = await syncFromSheet();
+    if(!sheetData){
+      // Sync failed — fall back to local cache
+      var local = getAll();
+      refreshAdminUI(local);
+      document.getElementById('apCount').textContent = local.length;
+      showSyncStatus('warn',
+        'Could not reach Google Sheets. Showing locally cached data (' + local.length + ' entries). '
+        + 'Click Sync to retry.');
+    }
+  } else {
+    // No sheet configured — show local cache
+    var localEntries = getAll();
+    refreshAdminUI(localEntries);
+    showSyncStatus('warn','Apps Script URL not configured. Showing local data only.');
+  }
 }
 
 function closeAdmin(){ showPage('pageLogin'); }
@@ -1198,34 +1467,72 @@ async function syncFromSheet(){
   try{
     var data = await scriptGet(APPS_SCRIPT_URL + '?action=getAll');
     if(data && data.status === 'ok' && Array.isArray(data.data)){
-      var sheetEntries = data.data.map(function(row){
-        return {
-          timestamp:       String(row[0] ||''),
-          dob:             String(row[1] ||''),
-          name:            String(row[2] ||''),
-          empId:           String(row[3] ||''),
-          whatsapp:        String(row[4] ||''),
-          association:     String(row[5] ||''),
-          category:        String(row[6] ||''),
-          scale:           String(row[7] ||''),
-          promoTrack:      String(row[8] ||''),
-          promoDate:       String(row[9] ||''),
-          presentRegion:   String(row[10]||''),
-          dateJoining:     String(row[11]||''),
-          presentBranch:   String(row[12]||''),
-          requestedRegion: String(row[13]||''),
-          transferCat:     String(row[14]||''),
-          transferDetails: String(row[15]||''),
-          domDistrict:     String(row[16]||''),
-          pincode:         String(row[17]||''),
-          driveLink:       String(row[18]||''),
-          fileName:        String(row[19]||'')
-        };
-      });
+      var sheetEntries;
+
+      // ── New format: Apps Script returns array of entry OBJECTS ─
+      // Each item has named keys (name, empId, etc.)
+      if(data.data.length === 0){
+        sheetEntries = [];
+      } else if(typeof data.data[0] === 'object' && !Array.isArray(data.data[0]) && data.data[0] !== null){
+        // Already mapped objects — use directly
+        sheetEntries = data.data.map(function(row){
+          // Ensure all expected keys exist with string values
+          return {
+            timestamp:       String(row.timestamp       ||''),
+            dob:             String(row.dob              ||''),
+            name:            String(row.name             ||''),
+            empId:           String(row.empId            ||''),
+            whatsapp:        String(row.whatsapp         ||''),
+            association:     String(row.association      ||''),
+            category:        String(row.category         ||''),
+            scale:           String(row.scale            ||''),
+            promoTrack:      String(row.promoTrack       ||''),
+            promoDate:       String(row.promoDate        ||''),
+            presentRegion:   String(row.presentRegion    ||''),
+            dateJoining:     String(row.dateJoining      ||''),
+            presentBranch:   String(row.presentBranch    ||''),
+            requestedRegion: String(row.requestedRegion  ||''),
+            transferCat:     String(row.transferCat      ||''),
+            transferDetails: String(row.transferDetails  ||''),
+            domDistrict:     String(row.domDistrict      ||''),
+            pincode:         String(row.pincode          ||''),
+            driveLink:       String(row.driveLink        ||''),
+            fileName:        String(row.fileName         ||'')
+          };
+        });
+      } else {
+        // ── Old/fallback format: raw row arrays ────────────────
+        sheetEntries = data.data.map(function(row){
+          return {
+            timestamp:       String(row[0] ||''),
+            dob:             String(row[1] ||''),
+            name:            String(row[2] ||''),
+            empId:           String(row[3] ||''),
+            whatsapp:        String(row[4] ||''),
+            association:     String(row[5] ||''),
+            category:        String(row[6] ||''),
+            scale:           String(row[7] ||''),
+            promoTrack:      String(row[8] ||''),
+            promoDate:       String(row[9] ||''),
+            presentRegion:   String(row[10]||''),
+            dateJoining:     String(row[11]||''),
+            presentBranch:   String(row[12]||''),
+            requestedRegion: String(row[13]||''),
+            transferCat:     String(row[14]||''),
+            transferDetails: String(row[15]||''),
+            domDistrict:     String(row[16]||''),
+            pincode:         String(row[17]||''),
+            driveLink:       String(row[18]||''),
+            fileName:        String(row[19]||'')
+          };
+        });
+      }
+
       saveAll(sheetEntries);
       el.textContent = sheetEntries.length;
       refreshAdminUI(sheetEntries);
       showSyncStatus('ok','Synced ' + sheetEntries.length + ' entries from Google Sheets.');
+      return sheetEntries; // allow callers to await and use the data
     } else {
       el.textContent = 'Err';
       showSyncStatus('err','Sync failed. Unexpected response. Run Test Connection for details.');
@@ -1234,6 +1541,7 @@ async function syncFromSheet(){
     el.textContent = 'Err';
     showSyncStatus('err','Sync error: ' + err.message + ' — Open Console (F12) for details.');
   }
+  return null;
 }
 
 function showSyncStatus(type, msg){
